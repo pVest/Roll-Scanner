@@ -1,0 +1,149 @@
+// ===== LEARNING LIBRARY SERVICE =====
+// The NEW automatic "memory" of the scanning system - separate from the
+// older, manually-curated Template Library (TemplateService.js).
+//
+// Key difference from Template Library:
+//   - Template Library: a human-maintained catalog (Add Template screen),
+//     keyed by vendor name, storing full OCR text + photo. Useful as a
+//     human-readable reference and as an OCR fallback helper.
+//   - Learning Library: fully automatic, keyed by BARCODE SHAPE (see
+//     BarcodeInterpreter.shapeOf), updated every time a scan is Accepted
+//     on the Confirm Screen - including when the user corrects a wrong
+//     guess via Edit Manually. No manual data entry required.
+//
+// Why shape instead of vendor name: when barcode-first scanning succeeds,
+// OCR never runs, so the vendor name is never read. The only thing we
+// reliably know is the FORMAT of the barcodes seen. Indexing by shape lets
+// the system get faster/more confident on a label type even before it has
+// ever OCR'd that vendor's name.
+//
+// What's intentionally NOT stored here (keeps records small and fast to
+// read): full OCR text, full-resolution photos. Those stay in Template
+// Library, which a human curates deliberately. This library stores only
+// what BarcodeInterpreter and ScanEngine need to make faster decisions:
+// the Roll ID shape, the expected Weight digit-length, a running
+// confidence built from confirmation history, and (once OCR has confirmed
+// it at least once) a link to the matching Template Library record, so
+// human-readable usage stats ("Domtar LynxJet 60lb - 452 scans") can be
+// shown even on scans where OCR never ran (see ConfirmScreen +
+// TemplateService.recordTemplateUsage, which is what actually increments
+// that human-facing count - this file only stores the shape <-> template
+// link, it does not track usage counts per vendor/product itself).
+
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { shapeOf } from './BarcodeInterpreter';
+
+const LEARNING_STORAGE_KEY = 'ROLL_LABEL_LEARNING_SHAPES';
+
+// Get every learned shape record.
+// Record shape: {
+//   rollIdShape: "AAA99A9999999",
+//   weightLength: 4,
+//   confirmedCount: 5,
+//   correctedCount: 1,        // how many times a human had to fix a guess
+//   lastRollIdExample: "DTR55H0829359",
+//   lastWeightExample: "1747",
+//   linkedTemplateId: "1234567890" | null,  // Template Library id, once known
+//   firstSeenAt: "...",
+//   lastConfirmedAt: "...",
+// }
+export async function getLearnedShapes() {
+  const saved = await AsyncStorage.getItem(LEARNING_STORAGE_KEY);
+  return saved ? JSON.parse(saved) : [];
+}
+
+async function saveLearnedShapes(shapes) {
+  await AsyncStorage.setItem(LEARNING_STORAGE_KEY, JSON.stringify(shapes));
+}
+
+// Records a confirmed (or corrected) scan result, teaching the Learning
+// Library this barcode shape for next time. Called from the Confirm
+// Screen's Accept handler, regardless of whether the user edited the
+// values or accepted them as-is - both are valuable signal.
+//
+// rollId / weight: the FINAL, human-confirmed values (after any manual edit)
+// wasGuessCorrect: true if the system's original guess matched what the
+//   user accepted unedited; false if the user had to correct it. Used to
+//   track correctedCount, which flags shapes the heuristics struggle with.
+// templateId: if this scan was also matched to a Template Library record
+//   (e.g. via LibraryMatcher, when OCR ran), pass its id so this shape
+//   becomes permanently linked to that human-readable roll type. Once
+//   linked, future scans of the SAME shape can report usage against the
+//   template even on scans where barcode alone succeeded and OCR never
+//   ran. A shape is linked at most once - the first confirmed link wins,
+//   since the same physical barcode format should always belong to the
+//   same roll type.
+export async function recordConfirmation({ rollId, weight, wasGuessCorrect, templateId }) {
+  if (!rollId) return; // nothing to learn without at least a Roll ID
+
+  const shapes = await getLearnedShapes();
+  const rollIdShape = shapeOf(rollId);
+  const weightLength = weight ? String(weight).length : null;
+
+  const existingIndex = shapes.findIndex((shape) => shape.rollIdShape === rollIdShape);
+  const now = new Date().toISOString();
+
+  if (existingIndex === -1) {
+    shapes.push({
+      rollIdShape,
+      weightLength,
+      confirmedCount: 1,
+      correctedCount: wasGuessCorrect ? 0 : 1,
+      lastRollIdExample: rollId,
+      lastWeightExample: weight || null,
+      linkedTemplateId: templateId || null,
+      firstSeenAt: now,
+      lastConfirmedAt: now,
+    });
+  } else {
+    const existing = shapes[existingIndex];
+
+    shapes[existingIndex] = {
+      ...existing,
+      // Keep the most commonly seen weight length - if a label format
+      // sometimes shows 3-digit and sometimes 4-digit weights, lean
+      // toward whichever was confirmed most recently rather than
+      // averaging (averaging digit-counts doesn't make sense).
+      weightLength: weightLength != null ? weightLength : existing.weightLength,
+      confirmedCount: existing.confirmedCount + 1,
+      correctedCount: existing.correctedCount + (wasGuessCorrect ? 0 : 1),
+      lastRollIdExample: rollId,
+      lastWeightExample: weight || existing.lastWeightExample,
+      // First confirmed link wins - don't overwrite an existing link with
+      // a different template id (would only happen if LibraryMatcher
+      // momentarily mismatched; the original link is more trustworthy
+      // since it's based on more accumulated evidence).
+      linkedTemplateId: existing.linkedTemplateId || templateId || null,
+      lastConfirmedAt: now,
+    };
+  }
+
+  await saveLearnedShapes(shapes);
+
+  return shapes[existingIndex === -1 ? shapes.length - 1 : existingIndex];
+}
+
+// Returns the templateId already linked to this Roll ID's shape, if any -
+// lets ScanEngine show a human-readable label type even on scans where
+// barcode alone succeeded and OCR never ran (see header comment).
+export function getLinkedTemplateId(rollId, knownShapes) {
+  if (!rollId || !knownShapes) return null;
+
+  const shape = knownShapes.find((entry) => entry.rollIdShape === shapeOf(rollId));
+  return shape?.linkedTemplateId || null;
+}
+
+// Returns true if a shape has been corrected often enough that
+// BarcodeInterpreter's confidence for it should be treated cautiously.
+// (Exposed for the Confirm Screen / debug views - "this label type has
+// needed manual correction 3 of the last 5 times".)
+export function isUnreliableShape(shapeRecord) {
+  if (!shapeRecord || shapeRecord.confirmedCount < 3) return false;
+  return shapeRecord.correctedCount / shapeRecord.confirmedCount > 0.3;
+}
+
+// Clears all learned shapes. Mainly useful for debugging/testing, or if
+// the heuristics need a fresh start after a bad batch of corrections.
+export async function clearLearnedShapes() {
+  await AsyncStorage.removeItem(LEARNING_STORAGE_KEY);
+}

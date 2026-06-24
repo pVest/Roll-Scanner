@@ -1,0 +1,112 @@
+// ===== WEIGHT EXTRACTOR =====
+// Finds the roll weight in OCR text using a priority order, instead of
+// just grabbing the first plausible-looking number:
+//
+//   1. NET     (the actual paper weight, excluding the core/packaging)
+//   2. GROSS   (paper + core/packaging - used if NET isn't on the label)
+//   3. WT / WEIGHT / LB / LBS  (generic weight label, lowest confidence)
+//
+// Returns { weight, source, confidence } so callers (ScanEngine) can show
+// the user how sure the system is and which field the number came from.
+
+// Plausible roll weight range in pounds. Filters out unrelated numbers
+// (order numbers, dates, lengths in feet) that happen to be 3-5 digits.
+//
+// UPPER BOUND NOTE: lowered from 10000 to 4000 to match
+// BarcodeInterpreter.js's MAX_PLAUSIBLE_WEIGHT - kept in sync deliberately
+// so the barcode and OCR paths agree on what "looks like a weight" no
+// matter which one a given scan ends up using. Based on real warehouse
+// data: rolls on hand top out around 2300lb, with some margin for
+// heavier ones, but nothing anywhere near 10000lb.
+const MIN_PLAUSIBLE_WEIGHT = 100;
+const MAX_PLAUSIBLE_WEIGHT = 4000;
+
+function isPlausibleWeight(value) {
+  return value >= MIN_PLAUSIBLE_WEIGHT && value <= MAX_PLAUSIBLE_WEIGHT;
+}
+
+// Looks for a number near a given set of keywords. Handles two common OCR
+// layouts:
+//  - keyword and number on the SAME line: "NET 3749", "Roll Weight 2141lbs"
+//  - keyword and number on SEPARATE lines (very common - OCR often reads
+//    a label's column header and its value as different lines):
+//      "ROLL WEIGHT"        "NET"
+//      "1516"               "3749"
+// so each keyword line is checked together with the next 2 lines.
+function findNumberNearKeywords(text, keywords) {
+  if (!text) return null;
+
+  const lines = text.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i++) {
+    const upperLine = lines[i].toUpperCase();
+
+    const hasKeyword = keywords.some((keyword) => upperLine.includes(keyword));
+    if (!hasKeyword) continue;
+
+    // Search this line plus the next couple of lines for a plausible number
+    for (let j = i; j <= Math.min(i + 2, lines.length - 1); j++) {
+      const line = lines[j];
+      const numberMatches = [...line.matchAll(/\d[\d,]*(?:\.\d+)?/g)];
+
+      for (const match of numberMatches) {
+        const raw = match[0].replace(/,/g, '');
+        const value = Math.round(parseFloat(raw));
+
+        if (!isPlausibleWeight(value)) continue;
+
+        // Skip numbers that are clearly a kg figure in parentheses, e.g.
+        // "(971.2kg)" - check a few characters after the match.
+        const afterText = line
+          .slice(match.index + match[0].length, match.index + match[0].length + 4)
+          .toUpperCase();
+        if (afterText.includes('KG')) continue;
+
+        return value;
+      }
+    }
+  }
+
+  return null;
+}
+
+// Main entry point. `text` is OCR output from the cropped label photo
+// (or from a small Weight Box region in zone-based scanning).
+export function extractWeight(text) {
+  if (!text) {
+    return { weight: null, source: null, confidence: 0 };
+  }
+
+  // 1. NET weight - highest priority, most accurate for billing/manifest
+  const net = findNumberNearKeywords(text, ['NET']);
+  if (net != null) {
+    return { weight: String(net), source: 'NET', confidence: 0.95 };
+  }
+
+  // 2. GROSS / Roll Weight - second priority
+  const gross = findNumberNearKeywords(text, ['GROSS', 'ROLL WEIGHT', 'POIDS']);
+  if (gross != null) {
+    return { weight: String(gross), source: 'GROSS', confidence: 0.85 };
+  }
+
+  // 3. Generic WEIGHT / WT / LB / LBS label - lowest confidence backup
+  const generic = findNumberNearKeywords(text, ['WEIGHT', 'WT', 'LBS', 'LB ']);
+  if (generic != null) {
+    return { weight: String(generic), source: 'WEIGHT_LABEL', confidence: 0.6 };
+  }
+
+  // 4. Last resort - any plausible 3-5 digit number followed by "LB"/"LBS"
+  // anywhere in the text (handles labels with no clear line keyword match,
+  // e.g. weight printed right next to a barcode with no shared line break)
+  const fallbackMatch = text.match(/\d[\d,]*(?:\.\d+)?\s*(?:LBS?|LB)\b/i);
+  if (fallbackMatch) {
+    const raw = fallbackMatch[0].replace(/[^\d.]/g, '');
+    const value = Math.round(parseFloat(raw));
+
+    if (isPlausibleWeight(value)) {
+      return { weight: String(value), source: 'WEIGHT_LABEL', confidence: 0.5 };
+    }
+  }
+
+  return { weight: null, source: null, confidence: 0 };
+}

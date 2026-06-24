@@ -1,0 +1,125 @@
+// ===== LIBRARY MATCHER (Library 2.0) =====
+// Answers one question: "What does this label look like?" - by comparing
+// the OCR text of a freshly scanned label against the OCR text saved on
+// every template, using word-overlap similarity. No line numbers, no
+// anchors, no "row 11" logic - just: does this text look like that text?
+//
+// This intentionally does NOT require the vendor name to literally appear
+// in the new scan (TemplateService.findSimilarTemplates does that, and is
+// kept for backward compatibility / the old screens). LibraryMatcher is
+// more forgiving: a template matches if enough of its distinctive words
+// (vendor name, paper grade, product name, finish, etc.) show up in the
+// new OCR text, even with OCR noise/typos affecting a few characters.
+//
+// Used by ScanEngine to confirm "this is a Domtar LynxJet label" / "this
+// is a Sappi Opus label" etc. before deciding how much to trust the
+// barcode/weight results.
+
+// Words shorter than this are ignored when comparing text - things like
+// "LB", "IN", "OF" are too common to be distinctive of any one vendor.
+const MIN_WORD_LENGTH = 3;
+
+// Common label words that appear on almost every roll label regardless of
+// vendor, so they don't help tell vendors apart. Excluding them makes the
+// similarity score reflect genuinely distinctive words (vendor name,
+// product line, grade) instead of being diluted by boilerplate.
+const STOPWORDS = new Set([
+  'ROLL', 'WEIGHT', 'WIDTH', 'LENGTH', 'DIAMETER', 'CORE', 'COLOR', 'COLOUR',
+  'FINISH', 'SMOOTH', 'WHITE', 'SPLICES', 'SIDE', 'GRADE', 'ORDER', 'CUSTOMER',
+  'SHIP', 'MADE', 'USA', 'CANADA', 'NET', 'GROSS', 'LBS', 'POSITION', 'LOCATION',
+  'INTERNAL', 'CHART', 'ITEM', 'CODE', 'PRODUCT', 'DESCRIPTION', 'MANUFACTURING',
+  'REF', 'MILL', 'UNWIND', 'PACK', 'PACKAGE', 'NUMBER', 'INSTRUCTIONS', 'SPECIAL',
+]);
+
+// Pulls distinctive, comparable words out of OCR text.
+function extractWords(text) {
+  if (!text) return [];
+
+  return (text.toUpperCase().match(/[A-Z0-9]+/g) || [])
+    .filter((word) => word.length >= MIN_WORD_LENGTH)
+    .filter((word) => !STOPWORDS.has(word))
+    // Drop pure-number tokens (order numbers, weights, dates) - they are
+    // almost never distinctive of a vendor/label type and can accidentally
+    // match unrelated templates that happen to share a similar quantity.
+    .filter((word) => !/^\d+$/.test(word));
+}
+
+// Jaccard-style overlap: how much of the SMALLER word set is also present
+// in the other set. Using the smaller set as the denominator means a
+// short, distinctive template (e.g. just "DOMTAR LYNXJET SMOOTH") isn't
+// unfairly penalized just because the new scan's OCR text is longer or
+// noisier.
+function similarityScore(wordsA, wordsB) {
+  if (wordsA.length === 0 || wordsB.length === 0) return 0;
+
+  const setA = new Set(wordsA);
+  const setB = new Set(wordsB);
+
+  const smaller = setA.size <= setB.size ? setA : setB;
+  const larger = setA.size <= setB.size ? setB : setA;
+
+  let overlap = 0;
+  for (const word of smaller) {
+    if (larger.has(word)) overlap++;
+  }
+
+  return overlap / smaller.size;
+}
+
+// Minimum similarity score (0-1) for a template to be considered a match
+// at all. Below this, LibraryMatcher reports "no known label type" rather
+// than guessing.
+const MATCH_THRESHOLD = 0.5;
+
+// Builds a human-readable label for a matched template, e.g.
+// "Domtar LynxJet 60lb" instead of just "Domtar" - more useful on the
+// Confirm Screen since basis weight is often what actually distinguishes
+// two templates from the same vendor.
+function buildLabelType(template) {
+  if (!template) return 'Unknown';
+
+  const parts = [template.vendor, template.product, template.basisWeight].filter(Boolean);
+  return parts.length > 0 ? parts.join(' ') : 'Unknown';
+}
+
+// Compares `ocrText` (from a fresh scan) against every saved template and
+// returns the best match, or null if nothing scores above MATCH_THRESHOLD.
+//
+// Returns: { template, labelType, confidence } | null
+export function matchLibrary(ocrText, templates) {
+  if (!ocrText || !templates || templates.length === 0) return null;
+
+  const scanWords = extractWords(ocrText);
+  if (scanWords.length === 0) return null;
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const template of templates) {
+    // V3 templates store a short `ocrKeywords` string derived from
+    // structured fields (vendor/product/basisWeight/...) instead of a
+    // full raw OCR transcript. Fall back to the old `ocrText` field only
+    // for templates saved before this change, so nothing already in
+    // AsyncStorage breaks.
+    const templateWords = extractWords(template.ocrKeywords || template.ocrText);
+    const score = similarityScore(scanWords, templateWords);
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = template;
+    }
+  }
+
+  if (!best || bestScore < MATCH_THRESHOLD) return null;
+
+  return {
+    template: best,
+    labelType: buildLabelType(best),
+    confidence: Math.round(bestScore * 100) / 100,
+  };
+}
+
+// Convenience: true/false version for callers that just want a yes/no.
+export function isKnownLabel(ocrText, templates) {
+  return matchLibrary(ocrText, templates) != null;
+}
